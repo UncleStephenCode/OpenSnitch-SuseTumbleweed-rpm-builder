@@ -25,6 +25,8 @@ set -Eeuo pipefail
 #   BUILD_UI=0 ./build-opensnitch-rpm-tw.sh
 #   STATIC_DAEMON=0 ./build-opensnitch-rpm-tw.sh
 #   STATIC_DAEMON=1 ./build-opensnitch-rpm-tw.sh
+#   PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
+#   PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
 #   DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
 #
 # Полезные переменные:
@@ -39,7 +41,11 @@ set -Eeuo pipefail
 #                               1    = требовать static, падать при ошибке
 #                               0    = сразу dynamic
 #   MINIMAL_INSTALL             1 = zypper --no-recommends при установке локальных RPM
-#   SKIP_EBPF                   1 = не собирать eBPF-модули
+#   PROCESS_MONITOR_METHOD      метод мониторинга процессов: ebpf, audit или proc
+#                               По умолчанию: ebpf
+#   SKIP_EBPF                   1 = не собирать eBPF-модули. Если переменная не задана,
+#                               при PROCESS_MONITOR_METHOD=ebpf используется 0,
+#                               при audit/proc используется 1
 #   RPM_RELEASE                 release RPM-пакета
 #   HOST_KERNEL                 версия ядра хоста, по умолчанию uname -r
 #   DOCKER_MOUNT_SUFFIX         суффикс bind mount, по умолчанию rw,Z
@@ -57,7 +63,18 @@ REBUILD_BUILDER="${REBUILD_BUILDER:-0}"
 BUILD_UI="${BUILD_UI:-1}"
 STATIC_DAEMON="${STATIC_DAEMON:-auto}"
 MINIMAL_INSTALL="${MINIMAL_INSTALL:-1}"
-SKIP_EBPF="${SKIP_EBPF:-0}"
+PROCESS_MONITOR_METHOD="${PROCESS_MONITOR_METHOD:-ebpf}"
+
+if [[ -z "${SKIP_EBPF+x}" ]]; then
+  if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" ]]; then
+    SKIP_EBPF="0"
+  else
+    SKIP_EBPF="1"
+  fi
+else
+  SKIP_EBPF="${SKIP_EBPF}"
+fi
+
 RPM_RELEASE="${RPM_RELEASE:-1.local$(date -u +%Y%m%d%H%M)}"
 HOST_KERNEL="${HOST_KERNEL:-$(uname -r)}"
 DOCKER_MOUNT_SUFFIX="${DOCKER_MOUNT_SUFFIX:-rw,Z}"
@@ -165,6 +182,15 @@ case "${STATIC_DAEMON}" in
   auto|0|1) ;;
   *) die "STATIC_DAEMON должен быть auto, 0 или 1" ;;
 esac
+
+case "${PROCESS_MONITOR_METHOD}" in
+  ebpf|audit|proc) ;;
+  *) die "PROCESS_MONITOR_METHOD должен быть ebpf, audit или proc" ;;
+esac
+
+if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" && "${SKIP_EBPF}" == "1" ]]; then
+  die "PROCESS_MONITOR_METHOD=ebpf требует SKIP_EBPF=0, иначе eBPF-модуль не будет собран и упакован"
+fi
 
 prepare_workdir
 
@@ -276,6 +302,8 @@ RUN set -eux; \
       zlib-devel-static \
       libbpf-devel \
       libbpf-devel-static \
+      bpftool \
+      dwarves \
       protobuf-devel \
       protobuf-source \
       kernel-default-devel \
@@ -381,6 +409,23 @@ else
   )
 fi
 
+DOCKER_EBPF_MOUNTS=()
+if [[ "${SKIP_EBPF}" != "1" ]]; then
+  if [[ -d "/lib/modules/${HOST_KERNEL}" ]]; then
+    DOCKER_EBPF_MOUNTS+=( -v "/lib/modules/${HOST_KERNEL}:/lib/modules/${HOST_KERNEL}:ro" )
+  else
+    warn "На хосте не найден /lib/modules/${HOST_KERNEL}; eBPF-сборка может не пройти"
+  fi
+
+  if [[ -d "/usr/src" ]]; then
+    DOCKER_EBPF_MOUNTS+=( -v "/usr/src:/usr/src:ro" )
+  fi
+
+  if [[ -d "/sys/kernel/btf" ]]; then
+    DOCKER_EBPF_MOUNTS+=( -v "/sys/kernel/btf:/sys/kernel/btf:ro" )
+  fi
+fi
+
 docker run --rm -i \
   "${DOCKER_USER_ARGS[@]}" \
   -e "REPO_URL=${REPO_URL}" \
@@ -388,6 +433,7 @@ docker run --rm -i \
   -e "RPM_RELEASE=${RPM_RELEASE}" \
   -e "HOST_KERNEL=${HOST_KERNEL}" \
   -e "SKIP_EBPF=${SKIP_EBPF}" \
+  -e "PROCESS_MONITOR_METHOD=${PROCESS_MONITOR_METHOD}" \
   -e "BUILD_UI=${BUILD_UI}" \
   -e "STATIC_DAEMON=${STATIC_DAEMON}" \
   -e "GO_BUILD_TAGS=${GO_BUILD_TAGS}" \
@@ -396,6 +442,7 @@ docker run --rm -i \
   -e "HOST_UID=$(id -u)" \
   -e "HOST_GID=$(id -g)" \
   -v "${WORKDIR}:/work:${DOCKER_MOUNT_SUFFIX}" \
+  "${DOCKER_EBPF_MOUNTS[@]}" \
   "${BUILDER_IMAGE}" \
   /bin/bash <<'CONTAINER_SCRIPT'
 set -Eeuo pipefail
@@ -418,6 +465,7 @@ REF="${REF:?}"
 RPM_RELEASE="${RPM_RELEASE:?}"
 HOST_KERNEL="${HOST_KERNEL:?}"
 SKIP_EBPF="${SKIP_EBPF:-0}"
+PROCESS_MONITOR_METHOD="${PROCESS_MONITOR_METHOD:-ebpf}"
 BUILD_UI="${BUILD_UI:-1}"
 STATIC_DAEMON="${STATIC_DAEMON:-auto}"
 GO_BUILD_TAGS="${GO_BUILD_TAGS:-netgo osusergo}"
@@ -585,6 +633,66 @@ build_daemon_minimal_deps() {
   save_binary_link_report ./opensnitchd opensnitchd
 }
 
+apply_process_monitor_method_to_config() {
+  local file="$1"
+  local method="$2"
+
+  [[ -f "${file}" ]] || return 0
+
+  python3 - "${file}" "${method}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+method = sys.argv[2]
+
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"cannot read JSON config {path}: {exc}")
+
+found = False
+
+def walk(obj):
+    global found
+    if isinstance(obj, dict):
+        for key in list(obj.keys()):
+            if key.lower() == "procmonitormethod":
+                obj[key] = method
+                found = True
+            else:
+                walk(obj[key])
+    elif isinstance(obj, list):
+        for item in obj:
+            walk(item)
+
+walk(data)
+
+if not found and isinstance(data, dict):
+    data["ProcMonitorMethod"] = method
+
+path.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+}
+
+apply_process_monitor_method_to_service() {
+  local service_file="$1"
+  local method="$2"
+
+  [[ -f "${service_file}" ]] || return 0
+
+  if grep -q '^ExecStart=' "${service_file}"; then
+    sed -i -E "s#^ExecStart=.*opensnitchd.*#ExecStart=/usr/bin/opensnitchd -process-monitor-method ${method}#" "${service_file}"
+  else
+    cat >> "${service_file}" <<EOF
+
+# Added by local RPM builder
+ExecStart=/usr/bin/opensnitchd -process-monitor-method ${method}
+EOF
+  fi
+}
+
 make_filelist() {
   local root="$1"
   local out="$2"
@@ -671,6 +779,7 @@ say "Версия OpenSnitch: ${VERSION}"
 say "RPM Version: ${RPM_VERSION}"
 say "RPM Release: ${RPM_RELEASE}"
 say "STATIC_DAEMON=${STATIC_DAEMON}"
+say "PROCESS_MONITOR_METHOD=${PROCESS_MONITOR_METHOD}"
 say "BUILD_UI=${BUILD_UI}"
 
 PY_FLAVOR="$(python3 - <<'PY'
@@ -738,6 +847,8 @@ WantedBy=multi-user.target
 EOF
 fi
 
+apply_process_monitor_method_to_service "${DAEMON_PAYLOAD}/usr/lib/systemd/system/opensnitch.service" "${PROCESS_MONITOR_METHOD}"
+
 for f in \
   daemon/data/default-config.json \
   daemon/data/system-fw.json \
@@ -746,6 +857,8 @@ for f in \
     install -m 0644 "${f}" "${DAEMON_PAYLOAD}/etc/opensnitchd/"
   fi
 done
+
+apply_process_monitor_method_to_config "${DAEMON_PAYLOAD}/etc/opensnitchd/default-config.json" "${PROCESS_MONITOR_METHOD}"
 
 if compgen -G "daemon/data/rules/*.json" >/dev/null; then
   install -m 0600 daemon/data/rules/*.json "${DAEMON_PAYLOAD}/etc/opensnitchd/rules/"
@@ -761,26 +874,43 @@ if [[ -f utils/packaging/daemon/deb/debian/opensnitch.logrotate ]]; then
 fi
 
 if [[ "${SKIP_EBPF}" != "1" ]]; then
+  if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" && ! -e "/lib/modules/${HOST_KERNEL}/build" ]]; then
+    die "Для PROCESS_MONITOR_METHOD=ebpf нужны заголовки текущего ядра: /lib/modules/${HOST_KERNEL}/build. Установите kernel-default-devel для текущего ядра или используйте PROCESS_MONITOR_METHOD=proc."
+  fi
+
   if [[ -x utils/packaging/build_modules.sh || -f utils/packaging/build_modules.sh ]]; then
     KERNEL_SHORT="$(printf '%s\n' "${HOST_KERNEL}" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
     [[ -n "${KERNEL_SHORT}" ]] || die "Не удалось определить major.minor версию ядра из HOST_KERNEL=${HOST_KERNEL}"
 
-    say "Собираю eBPF-модули OpenSnitch для Linux ${KERNEL_SHORT}"
+    say "Собираю eBPF-модули OpenSnitch для Linux ${HOST_KERNEL} (${KERNEL_SHORT})"
     chmod +x utils/packaging/build_modules.sh
 
     if ./utils/packaging/build_modules.sh "${KERNEL_SHORT}"; then
       if compgen -G "ebpf_prog/modules/opensnitch*.o" >/dev/null; then
         install -m 0644 ebpf_prog/modules/opensnitch*.o "${DAEMON_PAYLOAD}/usr/lib/opensnitchd/ebpf/"
+        say "eBPF-модули упакованы в ${DAEMON_PAYLOAD}/usr/lib/opensnitchd/ebpf/"
       else
+        if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" ]]; then
+          die "eBPF build завершился без ebpf_prog/modules/opensnitch*.o, а PROCESS_MONITOR_METHOD=ebpf требует eBPF-модуль"
+        fi
         warn "eBPF build завершился без opensnitch*.o, продолжаю без eBPF-модулей"
       fi
     else
-      warn "Не удалось собрать eBPF-модули, продолжаю без них. При необходимости можно явно запустить SKIP_EBPF=1."
+      if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" ]]; then
+        die "Не удалось собрать eBPF-модули, а PROCESS_MONITOR_METHOD=ebpf требует рабочий eBPF-модуль. Для обхода используйте PROCESS_MONITOR_METHOD=proc."
+      fi
+      warn "Не удалось собрать eBPF-модули, продолжаю без них"
     fi
   else
+    if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" ]]; then
+      die "utils/packaging/build_modules.sh не найден, а PROCESS_MONITOR_METHOD=ebpf требует eBPF-модуль"
+    fi
     warn "utils/packaging/build_modules.sh не найден, eBPF-модули пропущены"
   fi
 else
+  if [[ "${PROCESS_MONITOR_METHOD}" == "ebpf" ]]; then
+    die "SKIP_EBPF=1 несовместим с PROCESS_MONITOR_METHOD=ebpf"
+  fi
   warn "SKIP_EBPF=1: eBPF-модули не будут включены в RPM"
 fi
 
@@ -828,6 +958,11 @@ fi
 
 make_filelist "${DAEMON_PAYLOAD}" "${FILELIST_DIR}/opensnitch.files"
 
+DAEMON_AUDIT_REQUIRES=""
+if [[ "${PROCESS_MONITOR_METHOD}" == "audit" ]]; then
+  DAEMON_AUDIT_REQUIRES="Requires:       audit"
+fi
+
 cat > "${RPM_TOP}/SPECS/opensnitch.spec" <<EOF
 Name:           opensnitch
 Version:        ${RPM_VERSION}
@@ -840,6 +975,7 @@ URL:            https://github.com/evilsocket/opensnitch
 # rpmbuild сам добавит auto-requires по фактически динамически связанным .so.
 # Если opensnitchd собрался статически, этих зависимостей почти не будет.
 Requires:       nftables
+${DAEMON_AUDIT_REQUIRES}
 Requires(post): systemd
 Requires(preun): systemd
 Requires(postun): systemd
@@ -975,6 +1111,7 @@ rpm_version=${RPM_VERSION}
 release=${RPM_RELEASE}
 host_kernel=${HOST_KERNEL}
 skip_ebpf=${SKIP_EBPF}
+process_monitor_method=${PROCESS_MONITOR_METHOD}
 build_ui=${BUILD_UI}
 static_daemon=${STATIC_DAEMON}
 go_build_tags=${GO_BUILD_TAGS}

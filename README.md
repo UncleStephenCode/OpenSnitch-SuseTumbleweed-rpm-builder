@@ -32,6 +32,7 @@ opensnitch-ui
 - запускает Docker-контейнер с `-i`, с UID/GID текущего пользователя и с отдельным `HOME=/work/home`;
 - по умолчанию использует bind mount с суффиксом `rw,Z`, что помогает на системах с SELinux-контекстами;
 - оставляет отчёт по линковке демона в `opensnitch-rpm-work/out/opensnitchd.link-report.txt`.
+- параметризует метод мониторинга процессов через `PROCESS_MONITOR_METHOD`: `ebpf`, `audit` или `proc`; по умолчанию используется `ebpf`.
 
 ## Требования на хосте
 
@@ -136,6 +137,18 @@ STATIC_DAEMON=auto ./build-opensnitch-rpm-tw.sh
 SKIP_EBPF=1 ./build-opensnitch-rpm-tw.sh
 ```
 
+Выбрать метод мониторинга процессов:
+
+```bash
+PROCESS_MONITOR_METHOD=ebpf ./build-opensnitch-rpm-tw.sh
+PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
+PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
+```
+
+По умолчанию используется `PROCESS_MONITOR_METHOD=ebpf`. В этом режиме скрипт требует, чтобы eBPF-модули были собраны и упакованы. Если на новом ядре Tumbleweed появляется предупреждение вида `Error loading opensnitch.o`, можно собрать пакет с `PROCESS_MONITOR_METHOD=proc`: демон будет запущен с ключом `-process-monitor-method proc`, а `default-config.json` будет обновлён значением `ProcMonitorMethod=proc`.
+
+При `PROCESS_MONITOR_METHOD=proc` или `PROCESS_MONITOR_METHOD=audit`, если `SKIP_EBPF` не задан явно, eBPF-модули не собираются. При `PROCESS_MONITOR_METHOD=ebpf`, если `SKIP_EBPF` не задан явно, используется `SKIP_EBPF=0`.
+
 Отключить SELinux-релабелинг bind mount, если Docker ругается на `:Z`:
 
 ```bash
@@ -155,7 +168,8 @@ DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
 | `BUILD_UI` | `1` | Собирать `opensnitch-ui` |
 | `STATIC_DAEMON` | `auto` | `auto`, `1` или `0` для режима линковки демона |
 | `MINIMAL_INSTALL` | `1` | Использовать `zypper --no-recommends` |
-| `SKIP_EBPF` | `0` | Пропустить eBPF-модули |
+| `PROCESS_MONITOR_METHOD` | `ebpf` | Метод мониторинга процессов: `ebpf`, `audit` или `proc` |
+| `SKIP_EBPF` | зависит от `PROCESS_MONITOR_METHOD` | Пропустить eBPF-модули. По умолчанию `0` для `ebpf`, `1` для `audit/proc` |
 | `DOCKER_MOUNT_SUFFIX` | `rw,Z` | Суффикс Docker bind mount |
 | `RUN_AS_USER` | `1` | Запускать сборку внутри контейнера от UID/GID пользователя |
 | `PROTOC_GEN_GO_VERSION` | `v1.31.0` | Версия `protoc-gen-go` |
@@ -261,6 +275,55 @@ sudo zypper in \
 ```
 
 Замените `python313` на flavor, который показал ваш `python3`.
+
+## Метод мониторинга процессов
+
+OpenSnitch умеет использовать разные методы мониторинга процессов:
+
+| Метод | Что делает | Когда использовать |
+|---|---|---|
+| `ebpf` | Использует eBPF-модуль OpenSnitch | Режим по умолчанию. Лучший вариант, если модуль успешно грузится на вашем ядре |
+| `proc` | Использует `/proc` | Практичный fallback для новых ядер, если eBPF-модуль не загружается |
+| `audit` | Использует audit subsystem | Альтернатива, если в системе уже используется audit |
+
+По умолчанию сборщик использует:
+
+```bash
+PROCESS_MONITOR_METHOD=ebpf
+```
+
+В этом режиме скрипт пытается собрать eBPF-модули и завершает сборку ошибкой, если они не получились. Для сборки eBPF внутри Docker в контейнер пробрасываются каталоги хоста:
+
+```text
+/lib/modules/<текущее-ядро>
+/usr/src
+/sys/kernel/btf
+```
+
+Если после установки на первом запуске UI появляется предупреждение:
+
+```text
+[eBPF] Error loading opensnitch.o: unable to load eBPF module
+```
+
+можно пересобрать пакеты с fallback-методом:
+
+```bash
+PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
+```
+
+Скрипт в этом случае:
+
+- добавит в systemd unit запуск `opensnitchd -process-monitor-method proc`;
+- обновит `ProcMonitorMethod` в `default-config.json`;
+- по умолчанию пропустит сборку eBPF-модулей.
+
+Проверить фактический метод после установки:
+
+```bash
+systemctl cat opensnitch.service | grep ExecStart
+grep -i ProcMonitorMethod /etc/opensnitchd/default-config.json
+```
 
 ## Диагностика линковки демона
 
