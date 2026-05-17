@@ -28,10 +28,15 @@ set -Eeuo pipefail
 #   PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
 #   PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
 #   DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
+#   DOCKER_REGISTRY_PREFIX=harbor.example.org/docker-hub-proxy ./build-opensnitch-rpm-tw.sh
+#   DOCKER_BASE_IMAGE=registry.example.org/opensuse/tumbleweed ./build-opensnitch-rpm-tw.sh
 #
 # Полезные переменные:
 #   REPO_URL                    URL репозитория OpenSnitch
 #   REF                         latest, tag, branch или commit
+#   DOCKER_BASE_IMAGE           базовый образ для Dockerfile, по умолчанию opensuse/tumbleweed
+#   DOCKER_REGISTRY_PREFIX      опциональный префикс альтернативного registry/mirror
+#                               пример: harbor.example.org/docker-hub-proxy
 #   WORKDIR                     рабочий каталог сборки
 #   BUILDER_IMAGE               имя Docker image сборщика
 #   INSTALL                     1 = установить/обновить RPM после сборки, 0 = только собрать
@@ -56,6 +61,13 @@ set -Eeuo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/evilsocket/opensnitch.git}"
 REF="${REF:-latest}"
+DOCKER_BASE_IMAGE="${DOCKER_BASE_IMAGE:-opensuse/tumbleweed}"
+DOCKER_REGISTRY_PREFIX="${DOCKER_REGISTRY_PREFIX:-}"
+if [[ -n "${DOCKER_REGISTRY_PREFIX}" ]]; then
+  DOCKER_FROM_IMAGE="${DOCKER_REGISTRY_PREFIX%/}/${DOCKER_BASE_IMAGE#/}"
+else
+  DOCKER_FROM_IMAGE="${DOCKER_BASE_IMAGE}"
+fi
 WORKDIR="${WORKDIR:-$PWD/opensnitch-rpm-work}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-local/opensnitch-rpm-builder:tumbleweed}"
 INSTALL="${INSTALL:-1}"
@@ -194,9 +206,9 @@ fi
 
 prepare_workdir
 
-cat > "${WORKDIR}/Dockerfile" <<'DOCKERFILE'
-FROM opensuse/tumbleweed
-
+{
+  printf 'FROM %s\n\n' "${DOCKER_FROM_IMAGE}"
+  cat <<'DOCKERFILE'
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
@@ -386,6 +398,9 @@ RUN set -eux; \
     chmod +x /usr/local/bin/protoc; \
     protoc --version
 DOCKERFILE
+} > "${WORKDIR}/Dockerfile"
+
+say "Базовый Docker image: ${DOCKER_FROM_IMAGE}"
 
 if [[ "${REBUILD_BUILDER}" == "1" ]] || ! docker image inspect "${BUILDER_IMAGE}" >/dev/null 2>&1; then
   say "Собираю Docker image для сборки: ${BUILDER_IMAGE}"
@@ -429,6 +444,9 @@ fi
 docker run --rm -i \
   "${DOCKER_USER_ARGS[@]}" \
   -e "REPO_URL=${REPO_URL}" \
+  -e "DOCKER_BASE_IMAGE=${DOCKER_BASE_IMAGE}" \
+  -e "DOCKER_REGISTRY_PREFIX=${DOCKER_REGISTRY_PREFIX}" \
+  -e "DOCKER_FROM_IMAGE=${DOCKER_FROM_IMAGE}" \
   -e "REF=${REF}" \
   -e "RPM_RELEASE=${RPM_RELEASE}" \
   -e "HOST_KERNEL=${HOST_KERNEL}" \
@@ -461,6 +479,9 @@ die() {
 }
 
 REPO_URL="${REPO_URL:?}"
+DOCKER_BASE_IMAGE="${DOCKER_BASE_IMAGE:-}"
+DOCKER_REGISTRY_PREFIX="${DOCKER_REGISTRY_PREFIX:-}"
+DOCKER_FROM_IMAGE="${DOCKER_FROM_IMAGE:-}"
 REF="${REF:?}"
 RPM_RELEASE="${RPM_RELEASE:?}"
 HOST_KERNEL="${HOST_KERNEL:?}"
@@ -1105,6 +1126,9 @@ find "${RPM_TOP}/RPMS" -type f -name '*.rpm' -exec cp -v {} "${OUT_DIR}/" \;
 
 cat > "${OUT_DIR}/manifest.txt" <<EOF
 repo=${REPO_URL}
+docker_base_image=${DOCKER_BASE_IMAGE}
+docker_registry_prefix=${DOCKER_REGISTRY_PREFIX}
+docker_from_image=${DOCKER_FROM_IMAGE}
 ref=${RESOLVED_REF}
 version=${VERSION}
 rpm_version=${RPM_VERSION}

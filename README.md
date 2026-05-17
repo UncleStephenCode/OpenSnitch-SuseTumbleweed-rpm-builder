@@ -1,6 +1,8 @@
 # OpenSnitch RPM builder for openSUSE Tumbleweed
 
-Этот каталог содержит два вспомогательных скрипта для локальной сборки и установки OpenSnitch на openSUSE Tumbleweed:
+Проект содержит скрипт локальной сборки OpenSnitch в Docker и, при наличии рядом, скрипт очистки сборочного окружения.
+
+Основной сценарий:
 
 - `build-opensnitch-rpm-tw.sh` — получает исходный код OpenSnitch, собирает его внутри Docker-контейнера на базе `opensuse/tumbleweed`, формирует локальные RPM-пакеты и, при необходимости, устанавливает их через `zypper`.
 - `clean-opensnitch-build.sh` — очищает рабочий каталог сборки, Docker image сборщика, контейнеры и опционально Docker build cache.
@@ -9,54 +11,70 @@
 
 ## Что собирается
 
-По умолчанию собираются два пакета:
+По умолчанию формируются два RPM-пакета:
 
 ```text
 opensnitch
 opensnitch-ui
 ```
 
-`opensnitch` содержит демон `opensnitchd`, systemd unit, конфигурационные файлы и правила.
+`opensnitch` содержит демон `opensnitchd`, systemd unit, конфигурационные файлы, правила, задачи и, при выбранном `PROCESS_MONITOR_METHOD=ebpf`, eBPF-модули.
 
-`opensnitch-ui` содержит графический интерфейс OpenSnitch. Это Python/PyQt-приложение, поэтому оно не может быть превращено в один полностью статический ELF-бинарник. Runtime-зависимости UI вынесены в RPM-зависимости и подбираются под versioned Python-пакеты Tumbleweed, например `python313-PyQt6`.
+`opensnitch-ui` содержит графический интерфейс OpenSnitch. UI является Python/PyQt-приложением, поэтому он не собирается в один статический ELF-бинарник. Зависимости UI вынесены в RPM-зависимости и подбираются под versioned Python-пакеты Tumbleweed, например `python313-PyQt6`.
 
-## Особенности текущей версии
+## Ключевые особенности текущего сборщика
 
-Текущий вариант сборочного скрипта делает следующее:
+Текущий `build-opensnitch-rpm-tw.sh` делает следующее:
 
+- генерирует Dockerfile динамически;
+- позволяет задать альтернативный registry или полностью заменить базовый Docker-образ;
 - сначала пробует собрать `opensnitchd` статически;
 - если статическая линковка не удалась, собирает демон динамически;
-- оставшиеся динамические `.so`-зависимости не прописывает вручную, а отдаёт на обработку `rpmbuild` auto-requires;
-- для UI прописывает явные versioned Python/Qt зависимости;
-- использует совместимую версию `protoc-gen-go-grpc`, чтобы не получить ошибки вида `undefined: grpc.SupportPackageIsVersion9`;
-- запускает Docker-контейнер с `-i`, с UID/GID текущего пользователя и с отдельным `HOME=/work/home`;
-- по умолчанию использует bind mount с суффиксом `rw,Z`, что помогает на системах с SELinux-контекстами;
-- оставляет отчёт по линковке демона в `opensnitch-rpm-work/out/opensnitchd.link-report.txt`.
-- параметризует метод мониторинга процессов через `PROCESS_MONITOR_METHOD`: `ebpf`, `audit` или `proc`; по умолчанию используется `ebpf`.
+- оставшиеся динамические `.so`-зависимости отдаёт на обработку `rpmbuild` auto-requires;
+- прописывает явные versioned Python/Qt-зависимости для UI;
+- использует совместимые версии генераторов protobuf/gRPC;
+- запускает Docker-контейнер с `-i`, с UID/GID текущего пользователя и с `HOME=/work/home`;
+- по умолчанию использует bind mount `rw,Z`, что полезно на системах с SELinux;
+- параметризует метод мониторинга процессов через `PROCESS_MONITOR_METHOD`;
+- для eBPF-сборки пробрасывает в контейнер `/lib/modules/<текущее-ядро>`, `/usr/src` и `/sys/kernel/btf`, если они есть;
+- сохраняет отчёты о линковке демона в `opensnitch-rpm-work/out/`;
+- сохраняет сведения о сборке в `opensnitch-rpm-work/out/manifest.txt`.
 
 ## Требования на хосте
 
-На основной системе нужны только:
+Минимально нужны Docker, `zypper` и `sudo`:
 
 ```bash
-sudo zypper in docker zypper sudo
+sudo zypper in docker sudo
 sudo systemctl enable --now docker
 ```
 
-Если пользователь не входит в группу `docker`, запускайте скрипт через пользователя, которому доступен Docker, или добавьте пользователя в группу и перелогиньтесь:
+Если пользователь не входит в группу `docker`, добавьте его и перелогиньтесь:
 
 ```bash
 sudo usermod -aG docker "$USER"
 ```
 
-Для установки RPM нужен `zypper` и права `sudo`.
+Для установки собранных RPM нужны права `sudo`.
+
+Для режима `PROCESS_MONITOR_METHOD=ebpf` также нужны заголовки текущего ядра. На Tumbleweed обычно это пакет вида:
+
+```bash
+sudo zypper in kernel-default-devel
+```
+
+Проверьте, что ссылка на build-каталог ядра существует:
+
+```bash
+ls -l "/lib/modules/$(uname -r)/build"
+```
 
 ## Быстрый старт
 
-Сделайте скрипты исполняемыми:
+Сделайте скрипт исполняемым:
 
 ```bash
-chmod +x build-opensnitch-rpm-tw.sh clean-opensnitch-build.sh
+chmod +x build-opensnitch-rpm-tw.sh
 ```
 
 Первая сборка с пересозданием Docker image:
@@ -74,18 +92,85 @@ REBUILD_BUILDER=1 ./build-opensnitch-rpm-tw.sh
 Скрипт сам:
 
 1. создаст рабочий каталог `opensnitch-rpm-work`;
-2. соберёт Docker image `local/opensnitch-rpm-builder:tumbleweed`;
-3. клонирует OpenSnitch;
-4. сгенерирует protobuf-код;
-5. соберёт daemon и UI;
-6. сформирует RPM;
-7. установит их через `zypper`, если `INSTALL=1`.
+2. сформирует Dockerfile;
+3. соберёт локальный Docker image `local/opensnitch-rpm-builder:tumbleweed`;
+4. клонирует OpenSnitch;
+5. сгенерирует protobuf-код;
+6. соберёт daemon и UI;
+7. сформирует RPM;
+8. установит их через `zypper`, если `INSTALL=1`;
+9. включит и запустит `opensnitch.service`.
 
-Собранные пакеты будут лежать здесь:
+Собранные RPM и отчёты будут здесь:
 
 ```bash
 ls -lh opensnitch-rpm-work/out/
 ```
+
+## Альтернативный Docker registry или базовый образ
+
+По умолчанию сборщик использует базовый образ:
+
+```text
+opensuse/tumbleweed
+```
+
+### Registry mirror / proxy
+
+Если Docker Hub недоступен или нужно использовать корпоративный proxy/mirror:
+
+```bash
+DOCKER_REGISTRY_PREFIX=harbor.example.org/docker-hub-proxy \
+  REBUILD_BUILDER=1 ./build-opensnitch-rpm-tw.sh
+```
+
+В таком режиме Dockerfile будет начинаться с:
+
+```Dockerfile
+FROM harbor.example.org/docker-hub-proxy/opensuse/tumbleweed
+```
+
+### Полная замена базового образа
+
+Если нужен полностью квалифицированный образ:
+
+```bash
+DOCKER_BASE_IMAGE=registry.example.org/opensuse/tumbleweed \
+  REBUILD_BUILDER=1 ./build-opensnitch-rpm-tw.sh
+```
+
+В таком режиме Dockerfile будет начинаться с:
+
+```Dockerfile
+FROM registry.example.org/opensuse/tumbleweed
+```
+
+### Важные замечания
+
+`DOCKER_REGISTRY_PREFIX` влияет только на образ, из которого строится локальный builder image.
+
+Он не меняет:
+
+- URL исходников OpenSnitch;
+- репозитории `zypper` внутри контейнера;
+- источники Go-модулей;
+- Python/PyPI-источники, если они понадобятся внутри контейнера.
+
+Если нужно изменить openSUSE-репозитории внутри контейнера, используйте собственный `DOCKER_BASE_IMAGE`, где уже настроены нужные репозитории.
+
+Не задавайте одновременно `DOCKER_REGISTRY_PREFIX` и уже полностью квалифицированный `DOCKER_BASE_IMAGE`, иначе можно получить путь вида:
+
+```text
+mirror.example/registry.example.org/opensuse/tumbleweed
+```
+
+Итоговый локальный builder image по умолчанию остаётся:
+
+```text
+local/opensnitch-rpm-builder:tumbleweed
+```
+
+Изменить его можно переменной `BUILDER_IMAGE`.
 
 ## Основные режимы сборки
 
@@ -95,7 +180,7 @@ ls -lh opensnitch-rpm-work/out/
 INSTALL=0 ./build-opensnitch-rpm-tw.sh
 ```
 
-Собрать конкретную версию OpenSnitch:
+Собрать конкретный tag OpenSnitch:
 
 ```bash
 REF=v1.8.0 ./build-opensnitch-rpm-tw.sh
@@ -113,41 +198,11 @@ REF=master ./build-opensnitch-rpm-tw.sh
 BUILD_UI=0 ./build-opensnitch-rpm-tw.sh
 ```
 
-Принудительно динамическая сборка демона:
+Пересобрать Docker image сборщика:
 
 ```bash
-STATIC_DAEMON=0 ./build-opensnitch-rpm-tw.sh
+REBUILD_BUILDER=1 ./build-opensnitch-rpm-tw.sh
 ```
-
-Требовать строго статическую сборку демона и падать при неудаче:
-
-```bash
-STATIC_DAEMON=1 ./build-opensnitch-rpm-tw.sh
-```
-
-Автоматический режим, используемый по умолчанию:
-
-```bash
-STATIC_DAEMON=auto ./build-opensnitch-rpm-tw.sh
-```
-
-Пропустить сборку eBPF-модулей:
-
-```bash
-SKIP_EBPF=1 ./build-opensnitch-rpm-tw.sh
-```
-
-Выбрать метод мониторинга процессов:
-
-```bash
-PROCESS_MONITOR_METHOD=ebpf ./build-opensnitch-rpm-tw.sh
-PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
-PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
-```
-
-По умолчанию используется `PROCESS_MONITOR_METHOD=ebpf`. В этом режиме скрипт требует, чтобы eBPF-модули были собраны и упакованы. Если на новом ядре Tumbleweed появляется предупреждение вида `Error loading opensnitch.o`, можно собрать пакет с `PROCESS_MONITOR_METHOD=proc`: демон будет запущен с ключом `-process-monitor-method proc`, а `default-config.json` будет обновлён значением `ProcMonitorMethod=proc`.
-
-При `PROCESS_MONITOR_METHOD=proc` или `PROCESS_MONITOR_METHOD=audit`, если `SKIP_EBPF` не задан явно, eBPF-модули не собираются. При `PROCESS_MONITOR_METHOD=ebpf`, если `SKIP_EBPF` не задан явно, используется `SKIP_EBPF=0`.
 
 Отключить SELinux-релабелинг bind mount, если Docker ругается на `:Z`:
 
@@ -155,30 +210,145 @@ PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
 DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
 ```
 
-## Важные переменные
+Запустить сборку внутри контейнера от root, а не от UID/GID пользователя:
+
+```bash
+RUN_AS_USER=0 ./build-opensnitch-rpm-tw.sh
+```
+
+## Режим линковки daemon
+
+По умолчанию:
+
+```bash
+STATIC_DAEMON=auto
+```
+
+Доступные режимы:
+
+| Значение | Поведение |
+|---|---|
+| `auto` | сначала пробует статическую линковку, при неудаче собирает динамически |
+| `1` | требует строго статический `opensnitchd`, при неудаче завершает сборку ошибкой |
+| `0` | сразу собирает `opensnitchd` динамически |
+
+Примеры:
+
+```bash
+STATIC_DAEMON=auto ./build-opensnitch-rpm-tw.sh
+STATIC_DAEMON=1 ./build-opensnitch-rpm-tw.sh
+STATIC_DAEMON=0 ./build-opensnitch-rpm-tw.sh
+```
+
+Отчёты по линковке:
+
+```bash
+cat opensnitch-rpm-work/out/opensnitchd.file.txt
+cat opensnitch-rpm-work/out/opensnitchd.ldd.txt
+cat opensnitch-rpm-work/out/opensnitchd.link-report.txt
+```
+
+Если демон собрался статически, `ldd` обычно покажет:
+
+```text
+not a dynamic executable
+```
+
+Если демон собрался динамически, оставшиеся `.so` попадут в RPM auto-requires.
+
+## Метод мониторинга процессов
+
+OpenSnitch поддерживает несколько методов мониторинга процессов. Сборщик параметризует их через:
+
+```bash
+PROCESS_MONITOR_METHOD=ebpf
+```
+
+Допустимые значения:
+
+| Метод | Что делает | Когда использовать |
+|---|---|---|
+| `ebpf` | Использует eBPF-модуль OpenSnitch | Режим по умолчанию. Лучший вариант, если модуль успешно собирается и загружается |
+| `proc` | Использует `/proc` | Практичный fallback для новых ядер, если eBPF-модуль не загружается |
+| `audit` | Использует audit subsystem | Альтернатива, если в системе уже используется audit |
+
+Примеры:
+
+```bash
+PROCESS_MONITOR_METHOD=ebpf ./build-opensnitch-rpm-tw.sh
+PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
+PROCESS_MONITOR_METHOD=audit ./build-opensnitch-rpm-tw.sh
+```
+
+### Поведение `SKIP_EBPF`
+
+Если `SKIP_EBPF` не задан явно, сборщик выбирает значение автоматически:
+
+| `PROCESS_MONITOR_METHOD` | Значение `SKIP_EBPF` по умолчанию |
+|---|---:|
+| `ebpf` | `0` |
+| `proc` | `1` |
+| `audit` | `1` |
+
+При `PROCESS_MONITOR_METHOD=ebpf` нельзя использовать `SKIP_EBPF=1`: сборщик остановится, потому что eBPF-режим требует собранный и упакованный eBPF-модуль.
+
+### Что делает сборщик для выбранного метода
+
+Сборщик:
+
+- прописывает `-process-monitor-method <method>` в systemd unit;
+- обновляет `ProcMonitorMethod` в `default-config.json`;
+- при `audit` добавляет зависимость RPM на пакет `audit`;
+- при `ebpf` требует наличие `/lib/modules/<kernel>/build` и успешную сборку eBPF-модуля;
+- при `proc` или `audit` по умолчанию не собирает eBPF-модули.
+
+Проверить фактический метод после установки:
+
+```bash
+systemctl cat opensnitch.service | grep ExecStart
+grep -i ProcMonitorMethod /etc/opensnitchd/default-config.json
+```
+
+Если после установки появляется предупреждение:
+
+```text
+[eBPF] Error loading opensnitch.o: unable to load eBPF module
+```
+
+пересоберите пакет с fallback-методом:
+
+```bash
+PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
+```
+
+## Переменные сборщика
 
 | Переменная | По умолчанию | Назначение |
 |---|---:|---|
 | `REPO_URL` | `https://github.com/evilsocket/opensnitch.git` | URL репозитория OpenSnitch |
 | `REF` | `latest` | Git tag, branch или commit |
+| `DOCKER_BASE_IMAGE` | `opensuse/tumbleweed` | Базовый образ Dockerfile |
+| `DOCKER_REGISTRY_PREFIX` | пусто | Префикс альтернативного registry/mirror для базового образа |
 | `WORKDIR` | `$PWD/opensnitch-rpm-work` | Рабочий каталог сборки |
-| `BUILDER_IMAGE` | `local/opensnitch-rpm-builder:tumbleweed` | Docker image сборщика |
+| `BUILDER_IMAGE` | `local/opensnitch-rpm-builder:tumbleweed` | Локальный Docker image сборщика |
 | `INSTALL` | `1` | Устанавливать RPM после сборки |
-| `REBUILD_BUILDER` | `0` | Пересобрать Docker image |
+| `REBUILD_BUILDER` | `0` | Пересобрать Docker image сборщика |
 | `BUILD_UI` | `1` | Собирать `opensnitch-ui` |
-| `STATIC_DAEMON` | `auto` | `auto`, `1` или `0` для режима линковки демона |
-| `MINIMAL_INSTALL` | `1` | Использовать `zypper --no-recommends` |
-| `PROCESS_MONITOR_METHOD` | `ebpf` | Метод мониторинга процессов: `ebpf`, `audit` или `proc` |
-| `SKIP_EBPF` | зависит от `PROCESS_MONITOR_METHOD` | Пропустить eBPF-модули. По умолчанию `0` для `ebpf`, `1` для `audit/proc` |
-| `DOCKER_MOUNT_SUFFIX` | `rw,Z` | Суффикс Docker bind mount |
-| `RUN_AS_USER` | `1` | Запускать сборку внутри контейнера от UID/GID пользователя |
+| `STATIC_DAEMON` | `auto` | Режим линковки daemon: `auto`, `1`, `0` |
+| `MINIMAL_INSTALL` | `1` | Использовать `zypper --no-recommends` при установке локальных RPM |
+| `PROCESS_MONITOR_METHOD` | `ebpf` | Метод мониторинга процессов: `ebpf`, `audit`, `proc` |
+| `SKIP_EBPF` | зависит от `PROCESS_MONITOR_METHOD` | Пропустить eBPF-модули |
+| `RPM_RELEASE` | `1.local<UTC timestamp>` | Release RPM-пакета |
+| `HOST_KERNEL` | `$(uname -r)` | Версия ядра хоста для eBPF-сборки |
+| `DOCKER_MOUNT_SUFFIX` | `rw,Z` | Суффикс Docker bind mount для `/work` |
+| `RUN_AS_USER` | `1` | Запускать сборку в контейнере от UID/GID текущего пользователя |
 | `PROTOC_GEN_GO_VERSION` | `v1.31.0` | Версия `protoc-gen-go` |
 | `PROTOC_GEN_GO_GRPC_VERSION` | `v1.3.0` | Версия `protoc-gen-go-grpc` |
 | `GO_BUILD_TAGS` | `netgo osusergo` | Go build tags |
 
-## Ручная установка собранных RPM
+## Установка собранных RPM вручную
 
-Если сборка выполнялась с `INSTALL=0`, установите пакеты вручную через `zypper`, а не через `rpm -Uvh`, чтобы зависимости искались в репозиториях:
+Если сборка выполнялась с `INSTALL=0`, устанавливайте через `zypper`, а не через `rpm -Uvh`, чтобы зависимости искались в подключённых репозиториях:
 
 ```bash
 cd opensnitch-rpm-work/out
@@ -186,13 +356,13 @@ sudo zypper ref
 sudo zypper install --allow-unsigned-rpm ./*.rpm
 ```
 
-Для минимальной установки без рекомендуемых пакетов:
+Минимальная установка без рекомендуемых пакетов:
 
 ```bash
 sudo zypper install --no-recommends --allow-unsigned-rpm ./*.rpm
 ```
 
-Посмотреть зависимости пакетов:
+Посмотреть зависимости RPM:
 
 ```bash
 rpm -qpR ./*.rpm | sort -u
@@ -207,7 +377,7 @@ zypper search --provides 'python3dist(PyQt6)'
 
 ## Проверка после установки
 
-Проверьте daemon:
+Проверить daemon:
 
 ```bash
 sudo systemctl daemon-reload
@@ -215,17 +385,43 @@ sudo systemctl enable --now opensnitch.service
 systemctl status opensnitch.service --no-pager
 ```
 
-Запустите UI:
+Проверить, как запущен daemon:
+
+```bash
+systemctl cat opensnitch.service | grep ExecStart
+```
+
+Запустить UI:
 
 ```bash
 opensnitch-ui
 ```
 
-Проверьте, что PyQt6 импортируется системным Python:
+Проверить импорт PyQt6:
 
 ```bash
 python3 -c 'from PyQt6 import QtWidgets, QtCore; print("PyQt6 OK")'
 ```
+
+Посмотреть итоговый manifest сборки:
+
+```bash
+cat opensnitch-rpm-work/out/manifest.txt
+```
+
+В manifest сохраняются, среди прочего:
+
+- `repo`;
+- `docker_base_image`;
+- `docker_registry_prefix`;
+- `docker_from_image`;
+- `ref`;
+- `version`;
+- `host_kernel`;
+- `skip_ebpf`;
+- `process_monitor_method`;
+- `build_ui`;
+- `static_daemon`.
 
 ## Если UI не стартует из-за PyQt6
 
@@ -235,9 +431,9 @@ python3 -c 'from PyQt6 import QtWidgets, QtCore; print("PyQt6 OK")'
 ModuleNotFoundError: No module named 'PyQt6'
 ```
 
-На Tumbleweed пакет может называться не `python-PyQt6`, а versioned-именем вроде `python313-PyQt6`.
+На Tumbleweed пакет обычно называется versioned-именем вроде `python313-PyQt6`.
 
-Узнайте flavor текущего `python3`:
+Узнать flavor текущего `python3`:
 
 ```bash
 python3 - <<'PY'
@@ -246,7 +442,7 @@ print(f"python{sys.version_info.major}{sys.version_info.minor}")
 PY
 ```
 
-Если команда вывела, например, `python313`, установите:
+Если команда вывела `python313`, установите:
 
 ```bash
 sudo zypper in python313-PyQt6
@@ -260,7 +456,7 @@ zypper search --provides 'python3dist(PyQt6)'
 zypper search --provides 'python3dist(pyqt6)'
 ```
 
-Дополнительные UI-зависимости, которые могут понадобиться:
+Дополнительные UI-зависимости:
 
 ```bash
 sudo zypper in \
@@ -276,76 +472,9 @@ sudo zypper in \
 
 Замените `python313` на flavor, который показал ваш `python3`.
 
-## Метод мониторинга процессов
+## Диагностика protobuf/gRPC
 
-OpenSnitch умеет использовать разные методы мониторинга процессов:
-
-| Метод | Что делает | Когда использовать |
-|---|---|---|
-| `ebpf` | Использует eBPF-модуль OpenSnitch | Режим по умолчанию. Лучший вариант, если модуль успешно грузится на вашем ядре |
-| `proc` | Использует `/proc` | Практичный fallback для новых ядер, если eBPF-модуль не загружается |
-| `audit` | Использует audit subsystem | Альтернатива, если в системе уже используется audit |
-
-По умолчанию сборщик использует:
-
-```bash
-PROCESS_MONITOR_METHOD=ebpf
-```
-
-В этом режиме скрипт пытается собрать eBPF-модули и завершает сборку ошибкой, если они не получились. Для сборки eBPF внутри Docker в контейнер пробрасываются каталоги хоста:
-
-```text
-/lib/modules/<текущее-ядро>
-/usr/src
-/sys/kernel/btf
-```
-
-Если после установки на первом запуске UI появляется предупреждение:
-
-```text
-[eBPF] Error loading opensnitch.o: unable to load eBPF module
-```
-
-можно пересобрать пакеты с fallback-методом:
-
-```bash
-PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
-```
-
-Скрипт в этом случае:
-
-- добавит в systemd unit запуск `opensnitchd -process-monitor-method proc`;
-- обновит `ProcMonitorMethod` в `default-config.json`;
-- по умолчанию пропустит сборку eBPF-модулей.
-
-Проверить фактический метод после установки:
-
-```bash
-systemctl cat opensnitch.service | grep ExecStart
-grep -i ProcMonitorMethod /etc/opensnitchd/default-config.json
-```
-
-## Диагностика линковки демона
-
-Скрипт сохраняет отчёты:
-
-```bash
-cat opensnitch-rpm-work/out/opensnitchd.file.txt
-cat opensnitch-rpm-work/out/opensnitchd.ldd.txt
-cat opensnitch-rpm-work/out/opensnitchd.link-report.txt
-```
-
-Если `opensnitchd` собрался статически, `ldd` обычно покажет что-то вроде:
-
-```text
-not a dynamic executable
-```
-
-Если демон собрался динамически, оставшиеся `.so` будут видны в `ldd`, а RPM должен получить auto-requires на соответствующие библиотеки.
-
-## Диагностика protobuf/grpc
-
-Если при сборке daemon появляются ошибки вроде:
+Если при сборке daemon появляются ошибки вида:
 
 ```text
 undefined: grpc.SupportPackageIsVersion9
@@ -354,7 +483,7 @@ undefined: grpc.BidiStreamingClient
 
 значит сгенерированный Go gRPC-код не совместим с версией `grpc-go`, зафиксированной в OpenSnitch.
 
-По умолчанию используется:
+По умолчанию используются:
 
 ```bash
 PROTOC_GEN_GO_VERSION=v1.31.0
@@ -367,35 +496,29 @@ PROTOC_GEN_GO_GRPC_VERSION=v1.3.0
 PROTOC_GEN_GO_GRPC_VERSION=v1.2.0 ./build-opensnitch-rpm-tw.sh
 ```
 
-## Очистка
+## Проблемы с eBPF
 
-Обычная очистка с подтверждениями:
-
-```bash
-./clean-opensnitch-build.sh
-```
-
-Очистка без вопросов:
+Проверить наличие заголовков текущего ядра:
 
 ```bash
-YES=1 ./clean-opensnitch-build.sh
+ls -l "/lib/modules/$(uname -r)/build"
 ```
 
-Очистка рабочего каталога и Docker image сборщика:
+Если eBPF не собирается или не загружается, используйте fallback:
 
 ```bash
-YES=1 ./clean-opensnitch-build.sh
+PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
 ```
 
-Очистка вместе с Docker build cache:
+Если хотите строго собрать eBPF и не продолжать при ошибке, используйте режим по умолчанию:
 
 ```bash
-PRUNE_BUILD_CACHE=1 YES=1 ./clean-opensnitch-build.sh
+PROCESS_MONITOR_METHOD=ebpf ./build-opensnitch-rpm-tw.sh
 ```
 
-Скрипт очистки специально проверяет опасные пути и отказывается удалять `/`, `/home`, `/root`, `/usr`, `/var`, `/etc`, `/opt`, `/tmp` и сам `$HOME`.
+При `ebpf` сборщик завершится ошибкой, если модуль не собрался или не попал в пакет.
 
-## Что делать при проблемах с правами на `/work`
+## Проблемы с правами на `/work`
 
 Если внутри контейнера появляется ошибка вида:
 
@@ -403,18 +526,40 @@ PRUNE_BUILD_CACHE=1 YES=1 ./clean-opensnitch-build.sh
 mkdir: cannot create directory '/work/payload': Permission denied
 ```
 
-попробуйте:
+исправьте владельца рабочего каталога:
 
 ```bash
 sudo chown -R "$(id -u):$(id -g)" opensnitch-rpm-work
 ./build-opensnitch-rpm-tw.sh
 ```
 
-Если Docker ругается на `:Z` в bind mount:
+Если Docker ругается на `:Z`:
 
 ```bash
 DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
 ```
+
+## Очистка сборочных артефактов
+
+Если рядом есть `clean-opensnitch-build.sh`, обычная очистка запускается так:
+
+```bash
+./clean-opensnitch-build.sh
+```
+
+Без вопросов:
+
+```bash
+YES=1 ./clean-opensnitch-build.sh
+```
+
+С очисткой Docker build cache:
+
+```bash
+PRUNE_BUILD_CACHE=1 YES=1 ./clean-opensnitch-build.sh
+```
+
+Скрипт очистки должен удалять рабочий каталог, builder image, контейнеры сборщика и, если включено, build cache.
 
 ## Удаление установленных пакетов
 
@@ -425,13 +570,13 @@ sudo systemctl disable --now opensnitch.service
 sudo zypper rm opensnitch opensnitch-ui
 ```
 
-После удаления можно почистить сборочные артефакты:
+После этого можно удалить сборочные артефакты:
 
 ```bash
 YES=1 ./clean-opensnitch-build.sh
 ```
 
-## Примечания по безопасности
+## Безопасность и подпись RPM
 
 Собранные RPM являются локальными и неподписанными. Для установки используется:
 
@@ -439,4 +584,4 @@ YES=1 ./clean-opensnitch-build.sh
 sudo zypper install --allow-unsigned-rpm ./*.rpm
 ```
 
-Для личной локальной сборки это нормально. Для распространения пакетов лучше настроить собственную подпись RPM и локальный репозиторий.
+Для личного локального использования это нормально. Для распространения пакетов лучше настроить собственную подпись RPM и локальный репозиторий.
