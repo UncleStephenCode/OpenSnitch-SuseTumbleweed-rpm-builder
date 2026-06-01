@@ -4,10 +4,13 @@
 
 Основной сценарий:
 
-- `build-opensnitch-rpm-tw.sh` — получает исходный код OpenSnitch, собирает его внутри Docker-контейнера на базе `opensuse/tumbleweed`, формирует локальные RPM-пакеты и, при необходимости, устанавливает их через `zypper`.
-- `clean-opensnitch-build.sh` — очищает рабочий каталог сборки, Docker image сборщика, контейнеры и опционально Docker build cache.
+- `build-opensnitch-rpm-tw.sh` получает исходный код OpenSnitch из Git;
+- собирает `opensnitchd` и `opensnitch-ui` внутри Docker-контейнера на базе openSUSE Tumbleweed;
+- формирует локальные RPM-пакеты;
+- при `INSTALL=1` устанавливает или обновляет их через `zypper`;
+- не устанавливает сборочное окружение в основную систему.
 
-Сборочное окружение не устанавливается в основную систему: Go, Python build-зависимости, Qt-инструменты, `rpmbuild` и прочие пакеты ставятся только внутрь Docker image.
+Сборщик рассчитан на openSUSE Tumbleweed.
 
 ## Что собирается
 
@@ -345,6 +348,9 @@ PROCESS_MONITOR_METHOD=proc ./build-opensnitch-rpm-tw.sh
 | `PROTOC_GEN_GO_VERSION` | `v1.31.0` | Версия `protoc-gen-go` |
 | `PROTOC_GEN_GO_GRPC_VERSION` | `v1.3.0` | Версия `protoc-gen-go-grpc` |
 | `GO_BUILD_TAGS` | `netgo osusergo` | Go build tags |
+| `PY_GRPCIO_VERSION` | `1.80.0` | Версия `grpcio` в builder image для генерации Python gRPC-кода |
+| `PY_GRPCIO_TOOLS_VERSION` | равно `PY_GRPCIO_VERSION` | Версия `grpcio-tools`; должна быть не выше runtime `grpcio` из репозитория |
+| `PY_PROTOBUF_VERSION` | пусто | Опциональная фиксация версии `protobuf` в builder image |
 
 ## Установка собранных RPM вручную
 
@@ -585,3 +591,41 @@ sudo zypper install --allow-unsigned-rpm ./*.rpm
 ```
 
 Для личного локального использования это нормально. Для распространения пакетов лучше настроить собственную подпись RPM и локальный репозиторий.
+
+
+## Ошибка grpcio / grpcio-tools в opensnitch-ui
+
+Если `opensnitch-ui` падает с сообщением вида:
+
+```text
+The grpc package installed is at version 1.80.0, but the generated code in ui_pb2_grpc.py depends on grpcio>=1.81.0
+```
+
+значит Python gRPC-код был сгенерирован в Docker builder более новой версией `grpcio-tools`, чем версия `grpcio`, доступная в репозиториях Tumbleweed на итоговой системе.
+
+В исправленном сборщике Python gRPC-генератор зафиксирован параметрами:
+
+```bash
+PY_GRPCIO_VERSION=1.80.0
+PY_GRPCIO_TOOLS_VERSION=1.80.0
+```
+
+При изменении этих параметров нужно пересобирать Docker image сборщика, потому что `grpcio-tools` устанавливается внутрь builder image:
+
+```bash
+PY_GRPCIO_VERSION=1.80.0 \
+PY_GRPCIO_TOOLS_VERSION=1.80.0 \
+REBUILD_BUILDER=1 \
+./build-opensnitch-rpm-tw.sh
+```
+
+Если в репозиториях Tumbleweed обновится `python313-grpcio`, можно поднять версии генератора, но `PY_GRPCIO_TOOLS_VERSION` должен быть не выше runtime-версии `grpcio`, установленной в системе.
+
+Проверить runtime-версию можно так:
+
+```bash
+python3 - <<'PY'
+import grpc
+print(grpc.__version__)
+PY
+```

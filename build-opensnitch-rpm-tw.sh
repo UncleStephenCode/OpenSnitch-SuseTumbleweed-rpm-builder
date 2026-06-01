@@ -30,6 +30,7 @@ set -Eeuo pipefail
 #   DOCKER_MOUNT_SUFFIX=rw ./build-opensnitch-rpm-tw.sh
 #   DOCKER_REGISTRY_PREFIX=harbor.example.org/docker-hub-proxy ./build-opensnitch-rpm-tw.sh
 #   DOCKER_BASE_IMAGE=registry.example.org/opensuse/tumbleweed ./build-opensnitch-rpm-tw.sh
+#   PY_GRPCIO_VERSION=1.80.0 PY_GRPCIO_TOOLS_VERSION=1.80.0 REBUILD_BUILDER=1 ./build-opensnitch-rpm-tw.sh
 #
 # Полезные переменные:
 #   REPO_URL                    URL репозитория OpenSnitch
@@ -58,6 +59,9 @@ set -Eeuo pipefail
 #   PROTOC_GEN_GO_VERSION       версия protoc-gen-go
 #   PROTOC_GEN_GO_GRPC_VERSION  версия protoc-gen-go-grpc
 #   GO_BUILD_TAGS               build tags для Go, по умолчанию: netgo osusergo
+#   PY_GRPCIO_VERSION           версия grpcio в builder image для генерации Python gRPC-кода
+#   PY_GRPCIO_TOOLS_VERSION     версия grpcio-tools в builder image; должна быть <= runtime grpcio
+#   PY_PROTOBUF_VERSION         опциональная фиксация protobuf в builder image, пусто = не фиксировать
 
 REPO_URL="${REPO_URL:-https://github.com/evilsocket/opensnitch.git}"
 REF="${REF:-latest}"
@@ -98,6 +102,14 @@ PROTOC_GEN_GO_VERSION="${PROTOC_GEN_GO_VERSION:-v1.31.0}"
 PROTOC_GEN_GO_GRPC_VERSION="${PROTOC_GEN_GO_GRPC_VERSION:-v1.3.0}"
 
 GO_BUILD_TAGS="${GO_BUILD_TAGS:-netgo osusergo}"
+
+# grpcio-tools генерирует ui_pb2_grpc.py с проверкой минимальной версии grpcio.
+# Если builder использует grpcio-tools новее, чем grpcio из репозитория Tumbleweed,
+# opensnitch-ui падает с требованием обновить grpcio. Поэтому по умолчанию
+# фиксируем Python gRPC генератор на версии, совместимой с текущими пакетами Tumbleweed.
+PY_GRPCIO_VERSION="${PY_GRPCIO_VERSION:-1.80.0}"
+PY_GRPCIO_TOOLS_VERSION="${PY_GRPCIO_TOOLS_VERSION:-${PY_GRPCIO_VERSION}}"
+PY_PROTOBUF_VERSION="${PY_PROTOBUF_VERSION:-}"
 
 say() {
   echo "[INFO] $*"
@@ -376,21 +388,31 @@ RUN set -eux; \
     done; \
     zypper clean -a
 
+ARG PY_GRPCIO_VERSION=1.80.0
+ARG PY_GRPCIO_TOOLS_VERSION=1.80.0
+ARG PY_PROTOBUF_VERSION=
+
 RUN set -eux; \
+    if [[ -n "${PY_PROTOBUF_VERSION}" ]]; then \
+      protobuf_spec="protobuf==${PY_PROTOBUF_VERSION}"; \
+    else \
+      protobuf_spec="protobuf"; \
+    fi; \
     python3 -m pip install --break-system-packages --upgrade \
       pip \
       setuptools \
       wheel \
-      protobuf \
-      grpcio \
-      grpcio-tools || \
+      "${protobuf_spec}" \
+      "grpcio==${PY_GRPCIO_VERSION}" \
+      "grpcio-tools==${PY_GRPCIO_TOOLS_VERSION}" || \
     python3 -m pip install --upgrade \
       pip \
       setuptools \
       wheel \
-      protobuf \
-      grpcio \
-      grpcio-tools; \
+      "${protobuf_spec}" \
+      "grpcio==${PY_GRPCIO_VERSION}" \
+      "grpcio-tools==${PY_GRPCIO_TOOLS_VERSION}"; \
+    python3 -c 'import grpc, google.protobuf; print("builder python grpcio:", grpc.__version__); print("builder python protobuf:", google.protobuf.__version__)'; \
     printf '%s\n' \
       '#!/usr/bin/env bash' \
       'exec python3 -m grpc_tools.protoc "$@"' \
@@ -401,10 +423,17 @@ DOCKERFILE
 } > "${WORKDIR}/Dockerfile"
 
 say "Базовый Docker image: ${DOCKER_FROM_IMAGE}"
+say "Python gRPC generator: grpcio=${PY_GRPCIO_VERSION}, grpcio-tools=${PY_GRPCIO_TOOLS_VERSION}, protobuf=${PY_PROTOBUF_VERSION:-auto}"
 
 if [[ "${REBUILD_BUILDER}" == "1" ]] || ! docker image inspect "${BUILDER_IMAGE}" >/dev/null 2>&1; then
   say "Собираю Docker image для сборки: ${BUILDER_IMAGE}"
-  docker build -t "${BUILDER_IMAGE}" -f "${WORKDIR}/Dockerfile" "${WORKDIR}"
+  docker build \
+    --build-arg "PY_GRPCIO_VERSION=${PY_GRPCIO_VERSION}" \
+    --build-arg "PY_GRPCIO_TOOLS_VERSION=${PY_GRPCIO_TOOLS_VERSION}" \
+    --build-arg "PY_PROTOBUF_VERSION=${PY_PROTOBUF_VERSION}" \
+    -t "${BUILDER_IMAGE}" \
+    -f "${WORKDIR}/Dockerfile" \
+    "${WORKDIR}"
 else
   say "Использую существующий Docker image: ${BUILDER_IMAGE}"
 fi
@@ -457,6 +486,9 @@ docker run --rm -i \
   -e "GO_BUILD_TAGS=${GO_BUILD_TAGS}" \
   -e "PROTOC_GEN_GO_VERSION=${PROTOC_GEN_GO_VERSION}" \
   -e "PROTOC_GEN_GO_GRPC_VERSION=${PROTOC_GEN_GO_GRPC_VERSION}" \
+  -e "PY_GRPCIO_VERSION=${PY_GRPCIO_VERSION}" \
+  -e "PY_GRPCIO_TOOLS_VERSION=${PY_GRPCIO_TOOLS_VERSION}" \
+  -e "PY_PROTOBUF_VERSION=${PY_PROTOBUF_VERSION}" \
   -e "HOST_UID=$(id -u)" \
   -e "HOST_GID=$(id -g)" \
   -v "${WORKDIR}:/work:${DOCKER_MOUNT_SUFFIX}" \
@@ -490,6 +522,14 @@ PROCESS_MONITOR_METHOD="${PROCESS_MONITOR_METHOD:-ebpf}"
 BUILD_UI="${BUILD_UI:-1}"
 STATIC_DAEMON="${STATIC_DAEMON:-auto}"
 GO_BUILD_TAGS="${GO_BUILD_TAGS:-netgo osusergo}"
+
+# grpcio-tools генерирует ui_pb2_grpc.py с проверкой минимальной версии grpcio.
+# Если builder использует grpcio-tools новее, чем grpcio из репозитория Tumbleweed,
+# opensnitch-ui падает с требованием обновить grpcio. Поэтому по умолчанию
+# фиксируем Python gRPC генератор на версии, совместимой с текущими пакетами Tumbleweed.
+PY_GRPCIO_VERSION="${PY_GRPCIO_VERSION:-1.80.0}"
+PY_GRPCIO_TOOLS_VERSION="${PY_GRPCIO_TOOLS_VERSION:-${PY_GRPCIO_VERSION}}"
+PY_PROTOBUF_VERSION="${PY_PROTOBUF_VERSION:-}"
 PROTOC_GEN_GO_VERSION="${PROTOC_GEN_GO_VERSION:-v1.31.0}"
 PROTOC_GEN_GO_GRPC_VERSION="${PROTOC_GEN_GO_GRPC_VERSION:-v1.3.0}"
 HOST_UID="${HOST_UID:-0}"
@@ -814,6 +854,13 @@ export GOPATH="/work/gopath"
 export GOMODCACHE="/work/gomod"
 export GOCACHE="/work/gocache"
 export PATH="${PATH}:${GOPATH}/bin"
+
+say "Python gRPC generator versions: grpcio=${PY_GRPCIO_VERSION}, grpcio-tools=${PY_GRPCIO_TOOLS_VERSION}, protobuf=${PY_PROTOBUF_VERSION:-auto}"
+python3 - <<'PYINNER2' || true
+import grpc, google.protobuf
+print(f'python grpcio in builder runtime: {grpc.__version__}')
+print(f'python protobuf in builder runtime: {google.protobuf.__version__}')
+PYINNER2
 
 say "Устанавливаю protoc Go plugins"
 say "protoc-gen-go=${PROTOC_GEN_GO_VERSION}"
@@ -1141,6 +1188,9 @@ static_daemon=${STATIC_DAEMON}
 go_build_tags=${GO_BUILD_TAGS}
 protoc_gen_go=${PROTOC_GEN_GO_VERSION}
 protoc_gen_go_grpc=${PROTOC_GEN_GO_GRPC_VERSION}
+py_grpcio=${PY_GRPCIO_VERSION}
+py_grpcio_tools=${PY_GRPCIO_TOOLS_VERSION}
+py_protobuf=${PY_PROTOBUF_VERSION}
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 EOF
 
